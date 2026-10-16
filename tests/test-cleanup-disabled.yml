@@ -1,0 +1,26 @@
+name: Test cleanup step with DEPENDABOT_DISABLE_CLEANUP
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      # Disable the post-step Docker cleanup to avoid Docker socket issues in act
+      DEPENDABOT_DISABLE_CLEANUP: "1"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Run the action with cleanup disabled.
+      # The main step should still exit gracefully (non-dependabot actor under act).
+      # The post step (cleanup) will be skipped due to DEPENDABOT_DISABLE_CLEANUP=1.
+      - id: action
+        uses: .
+
+      - name: Assert action exited gracefully with cleanup disabled
+        run: |
+          echo "Action step outcome: ${{ steps.action.outcome }}"
+          if [ "${{ steps.action.outcome }}" != "success" ]; then
+            echo "FAIL: expected action to succeed when cleanup is disabled"
+            exit 1
+          fi
+          echo "PASS: action exited gracefully with DEPENDABOT_DISABLE_CLEANUP=1"

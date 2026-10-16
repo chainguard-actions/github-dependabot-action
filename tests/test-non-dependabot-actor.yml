@@ -1,0 +1,24 @@
+name: Test non-dependabot actor exits gracefully
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # The action checks ctx.actor === 'dependabot[bot]'.
+      # Under act the actor is never dependabot[bot], so the action should
+      # emit a warning and return null (log "finished: nothing to do") without
+      # calling setFailed — i.e. the step should succeed.
+      - id: action
+        uses: .
+
+      - name: Assert action exited gracefully
+        run: |
+          echo "Action step outcome: ${{ steps.action.outcome }}"
+          if [ "${{ steps.action.outcome }}" != "success" ]; then
+            echo "FAIL: expected action to succeed (exit gracefully) when actor is not dependabot[bot]"
+            exit 1
+          fi
+          echo "PASS: action exited gracefully for non-dependabot actor"
