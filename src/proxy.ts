@@ -1,0 +1,335 @@
+import * as core from '@actions/core'
+import Docker, {Container, Network} from 'dockerode'
+import fs from 'fs'
+import {md, pki} from 'node-forge'
+import {Credential} from './api-client'
+import {CertificateAuthority, ProxyConfig} from './config-types'
+import {ContainerService} from './container-service'
+import {errStream, outStream} from './utils'
+
+const KEY_SIZE = 2048
+const KEY_EXPIRY_YEARS = 2
+const CONFIG_FILE_PATH = '/'
+const CONFIG_FILE_NAME = 'config.json'
+const CA_CERT_INPUT_PATH = '/usr/local/share/ca-certificates'
+const CUSTOM_CA_CERT_NAME = 'custom-ca-cert.crt'
+const PROXY_READY_TIMEOUT_SECONDS = 60
+const CERT_SUBJECT = [
+  {
+    name: 'commonName',
+    value: 'Dependabot Internal CA'
+  },
+  {
+    name: 'organizationName',
+    value: 'GitHub Inc.'
+  },
+  {
+    shortName: 'OU',
+    value: 'Dependabot'
+  },
+  {
+    name: 'countryName',
+    value: 'US'
+  },
+  {
+    shortName: 'ST',
+    value: 'California'
+  },
+  {
+    name: 'localityName',
+    value: 'San Francisco'
+  }
+]
+
+export type Proxy = {
+  container: Container
+  network: Network
+  networkName: string
+  url: () => Promise<string>
+  waitUntilReady: () => Promise<void>
+  cert: string
+  shutdown: () => Promise<void>
+}
+
+export class ProxyBuilder {
+  constructor(
+    private readonly docker: Docker,
+    private readonly proxyImage: string,
+    private readonly experiments: object = {}
+  ) {}
+
+  async run(
+    jobId: number,
+    jobToken: string,
+    dependabotApiUrl: string,
+    credentials: Credential[]
+  ): Promise<Proxy> {
+    const name = `dependabot-job-${jobId}-proxy`
+    const config = this.buildProxyConfig(credentials)
+    const cert = config.ca.cert
+
+    const externalNetworkName = `dependabot-job-${jobId}-external-network`
+    const externalNetwork = await this.ensureNetwork(externalNetworkName, false)
+
+    const internalNetworkName = `dependabot-job-${jobId}-internal-network`
+    const internalNetwork = await this.ensureNetwork(internalNetworkName, true)
+
+    const container = await this.createContainer(
+      jobId,
+      jobToken,
+      dependabotApiUrl,
+      name,
+      externalNetwork,
+      internalNetwork,
+      internalNetworkName
+    )
+
+    await ContainerService.storeInput(
+      CONFIG_FILE_NAME,
+      CONFIG_FILE_PATH,
+      container,
+      config
+    )
+
+    const customCAPath = this.customCAPath()
+    if (customCAPath) {
+      core.info('Detected custom CA certificate, adding to proxy')
+
+      const customCert = fs.readFileSync(customCAPath, 'utf8').toString()
+      await ContainerService.storeCert(
+        CUSTOM_CA_CERT_NAME,
+        CA_CERT_INPUT_PATH,
+        container,
+        customCert
+      )
+    }
+
+    const stream = await container.attach({
+      stream: true,
+      stdout: true,
+      stderr: true
+    })
+    container.modem.demuxStream(
+      stream,
+      outStream('  proxy'),
+      errStream('  proxy')
+    )
+
+    const url = async (): Promise<string> => {
+      const containerInfo = await container.inspect()
+
+      if (containerInfo.State.Running === true) {
+        const ipAddress =
+          containerInfo.NetworkSettings.Networks[`${internalNetworkName}`]
+            .IPAddress
+        return `http://${ipAddress}:1080`
+      } else {
+        throw new Error("proxy container isn't running")
+      }
+    }
+
+    const waitUntilReady = async (): Promise<void> => {
+      try {
+        await ContainerService.execCommand(
+          container,
+          [
+            'timeout',
+            `${PROXY_READY_TIMEOUT_SECONDS}`,
+            'sh',
+            '-c',
+            'until nc -w 1 "$0" "$1" </dev/null; do sleep 0.1; done',
+            '127.0.0.1',
+            '1080'
+          ],
+          'root'
+        )
+      } catch (error) {
+        throw new Error(
+          `Proxy did not start accepting connections on port 1080 within ${PROXY_READY_TIMEOUT_SECONDS} seconds`,
+          {cause: error}
+        )
+      }
+    }
+
+    return {
+      container,
+      network: internalNetwork,
+      networkName: internalNetworkName,
+      url,
+      waitUntilReady,
+      cert,
+      shutdown: async () => {
+        const cleanupErrors: unknown[] = []
+        try {
+          await container.stop()
+        } catch (error) {
+          if (
+            typeof error !== 'object' ||
+            error === null ||
+            !('statusCode' in error) ||
+            error.statusCode !== 304
+          ) {
+            cleanupErrors.push(error)
+          }
+        }
+
+        try {
+          await container.remove()
+        } catch (error) {
+          cleanupErrors.push(error)
+        }
+
+        const networkCleanupResults = await Promise.allSettled([
+          externalNetwork.remove(),
+          internalNetwork.remove()
+        ])
+        for (const result of networkCleanupResults) {
+          if (result.status === 'rejected') {
+            cleanupErrors.push(result.reason)
+          }
+        }
+
+        if (cleanupErrors.length === 1) {
+          throw cleanupErrors[0]
+        }
+        if (cleanupErrors.length > 1) {
+          throw new AggregateError(cleanupErrors, 'Failed to clean up proxy')
+        }
+      }
+    }
+  }
+
+  private async ensureNetwork(name: string, internal = true): Promise<Network> {
+    const networks = await this.docker.listNetworks({
+      filters: JSON.stringify({name: [name]})
+    })
+    if (networks.length > 0) {
+      return this.docker.getNetwork(networks[0].Id)
+    } else {
+      return await this.docker.createNetwork({Name: name, Internal: internal})
+    }
+  }
+
+  private buildProxyConfig(credentials: Credential[]): ProxyConfig {
+    const ca = this.generateCertificateAuthority()
+
+    const config: ProxyConfig = {
+      all_credentials: credentials,
+      ca,
+      experiments: this.experiments
+    }
+
+    return config
+  }
+
+  private generateCertificateAuthority(): CertificateAuthority {
+    const keys = pki.rsa.generateKeyPair(KEY_SIZE)
+    const cert = pki.createCertificate()
+
+    cert.publicKey = keys.publicKey
+    cert.serialNumber = '01'
+    cert.validity.notBefore = new Date()
+    cert.validity.notAfter = new Date()
+    cert.validity.notAfter.setFullYear(
+      cert.validity.notBefore.getFullYear() + KEY_EXPIRY_YEARS
+    )
+
+    cert.setSubject(CERT_SUBJECT)
+    cert.setIssuer(CERT_SUBJECT)
+
+    cert.setExtensions([
+      {
+        name: 'basicConstraints',
+        cA: true,
+        critical: true
+      },
+      {
+        name: 'keyUsage',
+        digitalSignature: true,
+        keyEncipherment: true,
+        keyCertSign: true,
+        cRLSign: true,
+        critical: true
+      },
+      {
+        name: 'extKeyUsage',
+        serverAuth: true,
+        clientAuth: true
+      },
+      {
+        name: 'subjectKeyIdentifier'
+      },
+      {
+        name: 'authorityKeyIdentifier',
+        keyIdentifier: true,
+        authorityCertIssuer: true,
+        authorityCertSerialNumber: cert.serialNumber
+      }
+    ])
+
+    cert.sign(keys.privateKey, md.sha256.create())
+
+    const pem = pki.certificateToPem(cert)
+    const key = pki.privateKeyToPem(keys.privateKey)
+    return {cert: pem, key}
+  }
+
+  private async createContainer(
+    jobId: number,
+    jobToken: string,
+    dependabotApiUrl: string,
+    containerName: string,
+    externalNetwork: Network,
+    internalNetwork: Network,
+    internalNetworkName: string
+  ): Promise<Container> {
+    const container = await this.docker.createContainer({
+      Image: this.proxyImage,
+      name: containerName,
+      AttachStdout: true,
+      AttachStderr: true,
+      Env: [
+        `http_proxy=${process.env.http_proxy || process.env.HTTP_PROXY || ''}`,
+        `https_proxy=${
+          process.env.https_proxy || process.env.HTTPS_PROXY || ''
+        }`,
+        `no_proxy=${process.env.no_proxy || process.env.NO_PROXY || ''}`,
+        `JOB_ID=${jobId}`,
+        `JOB_TOKEN=${jobToken}`,
+        'PROXY_CACHE=true',
+        `DEPENDABOT_API_URL=${dependabotApiUrl}`,
+        `ACTIONS_ID_TOKEN_REQUEST_TOKEN=${process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN || ''}`,
+        `ACTIONS_ID_TOKEN_REQUEST_URL=${process.env.ACTIONS_ID_TOKEN_REQUEST_URL || ''}`,
+        // Pass through OPENSSL_FORCE_FIPS_MODE from the host if set.
+        // The container does not have the OpenSSL FIPS provider installed, so OpenSSL fails while running update-ca-certificates on FIPS-enabled self-hosted runners.
+        // Setting OPENSSL_FORCE_FIPS_MODE=0 on the host works around this by explicitly preventing OpenSSL from using FIPS.
+        // We only propagate the env variable when it is explicitly set so as not to alter default behavior.
+        ...(process.env.OPENSSL_FORCE_FIPS_MODE !== undefined
+          ? [`OPENSSL_FORCE_FIPS_MODE=${process.env.OPENSSL_FORCE_FIPS_MODE}`]
+          : [])
+      ],
+      Entrypoint: [
+        'sh',
+        '-c',
+        '/usr/sbin/update-ca-certificates && /dependabot-proxy'
+      ],
+
+      HostConfig: {
+        NetworkMode: internalNetworkName
+      }
+    })
+
+    await externalNetwork.connect({Container: container.id})
+
+    core.info(`Created proxy container: ${container.id}`)
+    return container
+  }
+
+  private customCAPath(): string | undefined {
+    if ('CUSTOM_CA_PATH' in process.env) {
+      return process.env.CUSTOM_CA_PATH
+    }
+    // default to node.js configuration
+    return process.env.NODE_EXTRA_CA_CERTS
+  }
+}
