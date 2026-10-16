@@ -1,1 +1,16 @@
-# github-dependabot-action
+# github/dependabot-action
+
+Runs dependabot-updater in Actions
+
+Hardened by [Chainguard](https://www.chainguard.dev) from the upstream action at [https://github.com/github/dependabot-action](https://github.com/github/dependabot-action).
+
+## Versions
+
+| Version | Tag | Upstream commit |
+|---------|-----|-----------------|
+| v3.0.0 | [`v3.0.0`](https://github.com/chainguard-actions/github-dependabot-action/tree/v3.0.0) | [`032bfdf`](https://github.com/github/dependabot-action/commit/032bfdfbc69936622cdbe46887c2a4e299162b25) |
+| v3.3.0 | [`v3.3.0`](https://github.com/chainguard-actions/github-dependabot-action/tree/v3.3.0) | [`4136362`](https://github.com/github/dependabot-action/commit/4136362d1f18d11898a40eeb1c97bf11816b7488) |
+
+## Privacy
+
+This Action contacts Chainguard's licensing server to verify authorization. Connection metadata (IP address, GitHub repository identifier, timestamp, and any metadata encoded in the auth token) is transmitted to Chainguard, Inc. even if authorization is denied in accordance with our [Privacy Notice](https://www.chainguard.dev/legal/privacy-notice)
