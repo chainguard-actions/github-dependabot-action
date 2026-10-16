@@ -1,0 +1,431 @@
+import {Updater} from '../src/updater'
+import Docker from 'dockerode'
+import {ContainerService} from '../src/container-service'
+import {ProxyBuilder} from '../src/proxy'
+
+// We do not need to build actual containers or run updates for this test.)
+jest.mock('dockerode')
+jest.mock('../src/container-service')
+jest.mock('../src/proxy')
+
+describe('Updater', () => {
+  const mockApiClient: any = {
+    getJobDetails: jest.fn(),
+    getCredentials: jest.fn(),
+    getJobToken: jest.fn(),
+    params: {
+      jobId: 1,
+      dependabotApiUrl: 'http://localhost:3001'
+    },
+    jobToken: 'job-token',
+    credentialsToken: 'job-credentials-token'
+  }
+
+  const mockJobDetails: any = {
+    id: '1',
+    'allowed-updates': [
+      {
+        'dependency-type': 'all'
+      }
+    ],
+    'package-manager': 'npm-and-yarn'
+  }
+
+  const mockProxy: any = {
+    container: {
+      start: jest.fn()
+    },
+    network: jest.fn(),
+    networkName: 'mockNetworkName',
+    url: () => {
+      'http://localhost'
+    },
+    cert: 'mockCertificate',
+    shutdown: jest.fn()
+  }
+
+  const mockContainer: any = {
+    id: 1
+  }
+
+  afterEach(async () => {
+    jest.clearAllMocks() // Reset any mocked classes
+  })
+
+  describe('when there is a happy path update', () => {
+    const updater = new Updater(
+      'MOCK_UPDATER_IMAGE_NAME',
+      'MOCK_PROXY_IMAGE_NAME',
+      mockApiClient,
+      mockJobDetails,
+      []
+    )
+
+    beforeEach(async () => {
+      jest
+        .spyOn(Docker.prototype, 'createContainer')
+        .mockResolvedValue(mockContainer)
+
+      jest.spyOn(ProxyBuilder.prototype, 'run').mockResolvedValue(mockProxy)
+      jest.spyOn(ContainerService, 'run').mockImplementationOnce(
+        jest.fn(async () => {
+          return true
+        })
+      )
+    })
+
+    it('should be successful', async () => {
+      expect(await updater.runUpdater()).toBe(true)
+    })
+  })
+
+  describe('when the updater container fails', () => {
+    const updater = new Updater(
+      'MOCK_UPDATER_IMAGE_NAME',
+      'MOCK_PROXY_IMAGE_NAME',
+      mockApiClient,
+      mockJobDetails,
+      []
+    )
+
+    beforeEach(async () => {
+      jest
+        .spyOn(Docker.prototype, 'createContainer')
+        .mockResolvedValue(mockContainer)
+
+      jest.spyOn(ProxyBuilder.prototype, 'run').mockResolvedValue(mockProxy)
+
+      jest
+        .spyOn(ContainerService, 'run')
+        .mockImplementationOnce(
+          jest.fn(async () =>
+            Promise.reject(new Error('Call to container service errored'))
+          )
+        )
+    })
+
+    it('should raise an error', async () => {
+      await expect(updater.runUpdater()).rejects.toThrow(
+        'Call to container service errored'
+      )
+    })
+  })
+
+  describe('when given credentials', () => {
+    const jobDetails = {...mockJobDetails}
+
+    new Updater(
+      'MOCK_UPDATER_IMAGE_NAME',
+      'MOCK_PROXY_IMAGE_NAME',
+      mockApiClient,
+      jobDetails,
+      [
+        {
+          type: 'git_source',
+          host: 'github.com',
+          username: 'user',
+          password: 'pass'
+        },
+        {
+          type: 'npm_registry',
+          host: 'registry.npmjs.org',
+          username: 'npm_user',
+          token: 'npm_token',
+          'replaces-base': true
+        }
+      ]
+    )
+
+    it('generates credentials metadata on the job definition', () => {
+      expect(jobDetails['credentials-metadata']).toEqual([
+        {
+          type: 'git_source',
+          host: 'github.com'
+        },
+        {
+          type: 'npm_registry',
+          host: 'registry.npmjs.org',
+          'replaces-base': true
+        }
+      ])
+    })
+  })
+
+  describe('when given npm_registry credentials with a URL and not a registry', () => {
+    const jobDetails = {...mockJobDetails}
+
+    new Updater(
+      'MOCK_UPDATER_IMAGE_NAME',
+      'MOCK_PROXY_IMAGE_NAME',
+      mockApiClient,
+      jobDetails,
+      [
+        {
+          type: 'npm_registry',
+          url: 'https://registry.npmjs.org/some/path',
+          username: 'npm_user',
+          token: 'npm_token'
+        }
+      ]
+    )
+
+    it('generates credentials metadata with the registry from the URL', () => {
+      expect(jobDetails['credentials-metadata']).toEqual([
+        {
+          type: 'npm_registry',
+          registry: 'registry.npmjs.org/some/path',
+          url: 'https://registry.npmjs.org/some/path'
+        }
+      ])
+    })
+  })
+
+  describe('when given npm_registry credentials with a URL and not a registry with no path', () => {
+    const jobDetails = {...mockJobDetails}
+
+    new Updater(
+      'MOCK_UPDATER_IMAGE_NAME',
+      'MOCK_PROXY_IMAGE_NAME',
+      mockApiClient,
+      jobDetails,
+      [
+        {
+          type: 'npm_registry',
+          url: 'https://registry.npmjs.org',
+          username: 'npm_user',
+          token: 'npm_token'
+        }
+      ]
+    )
+
+    it('generates credentials metadata with the registry from the URL', () => {
+      expect(jobDetails['credentials-metadata']).toEqual([
+        {
+          type: 'npm_registry',
+          registry: 'registry.npmjs.org/',
+          url: 'https://registry.npmjs.org'
+        }
+      ])
+    })
+  })
+
+  describe('when given docker credentials with a URL and not a registry', () => {
+    const jobDetails = {...mockJobDetails}
+
+    new Updater(
+      'MOCK_UPDATER_IMAGE_NAME',
+      'MOCK_PROXY_IMAGE_NAME',
+      mockApiClient,
+      jobDetails,
+      [
+        {
+          type: 'docker_registry',
+          url: 'https://ghcr.io/some/path',
+          username: 'user',
+          token: 'token'
+        }
+      ]
+    )
+
+    it('generates credentials metadata with the registry from the URL', () => {
+      expect(jobDetails['credentials-metadata']).toEqual([
+        {
+          type: 'docker_registry',
+          registry: 'ghcr.io',
+          url: 'https://ghcr.io/some/path'
+        }
+      ])
+    })
+  })
+
+  describe('when given python credentials with a URL and not an index-url', () => {
+    const jobDetails = {...mockJobDetails}
+
+    new Updater(
+      'MOCK_UPDATER_IMAGE_NAME',
+      'MOCK_PROXY_IMAGE_NAME',
+      mockApiClient,
+      jobDetails,
+      [
+        {
+          type: 'python_index',
+          url: 'https://example.com/some/path',
+          username: 'user',
+          token: 'token'
+        }
+      ]
+    )
+
+    it('generates credentials metadata with the index from the URL', () => {
+      expect(jobDetails['credentials-metadata']).toEqual([
+        {
+          'index-url': 'https://example.com/some/path',
+          type: 'python_index',
+          url: 'https://example.com/some/path'
+        }
+      ])
+    })
+  })
+
+  describe('when given composer credentials with a URL and not a registry', () => {
+    const jobDetails = {...mockJobDetails}
+
+    new Updater(
+      'MOCK_UPDATER_IMAGE_NAME',
+      'MOCK_PROXY_IMAGE_NAME',
+      mockApiClient,
+      jobDetails,
+      [
+        {
+          type: 'composer_repository',
+          url: 'https://example.com/some/path',
+          username: 'user',
+          token: 'token'
+        }
+      ]
+    )
+
+    it('generates credentials metadata with the registry from the URL', () => {
+      expect(jobDetails['credentials-metadata']).toEqual([
+        {
+          type: 'composer_repository',
+          registry: 'example.com',
+          url: 'https://example.com/some/path'
+        }
+      ])
+    })
+  })
+
+  describe('when given npm_registry credentials with a URL and not a registry, but the URL is malformed', () => {
+    const jobDetails = {...mockJobDetails}
+
+    new Updater(
+      'MOCK_UPDATER_IMAGE_NAME',
+      'MOCK_PROXY_IMAGE_NAME',
+      mockApiClient,
+      jobDetails,
+      [
+        {
+          type: 'npm_registry',
+          url: 'not-a-url',
+          username: 'npm_user',
+          token: 'npm_token'
+        }
+      ]
+    )
+
+    it('generates credentials metadata with the registry from the URL', () => {
+      expect(jobDetails['credentials-metadata']).toEqual([
+        {
+          type: 'npm_registry',
+          url: 'not-a-url'
+        }
+      ])
+    })
+  })
+
+  describe('when given duplicate credentials', () => {
+    const jobDetails = {...mockJobDetails}
+
+    new Updater(
+      'MOCK_UPDATER_IMAGE_NAME',
+      'MOCK_PROXY_IMAGE_NAME',
+      mockApiClient,
+      jobDetails,
+      [
+        {
+          type: 'git_source',
+          host: 'github.com',
+          username: 'user',
+          password: 'pass'
+        },
+        {
+          type: 'git_source',
+          host: 'github.com',
+          username: 'user',
+          password: 'pass'
+        }
+      ]
+    )
+
+    it('removes duplicates from the metadata', () => {
+      expect(jobDetails['credentials-metadata']).toEqual([
+        {
+          type: 'git_source',
+          host: 'github.com'
+        }
+      ])
+    })
+  })
+
+  describe('when given a jit_access type credential', () => {
+    const jobDetails = {...mockJobDetails}
+
+    new Updater(
+      'MOCK_UPDATER_IMAGE_NAME',
+      'MOCK_PROXY_IMAGE_NAME',
+      mockApiClient,
+      jobDetails,
+      [
+        {
+          type: 'git_source',
+          host: 'github.com',
+          username: 'user',
+          password: 'pass'
+        },
+        {
+          type: 'jit_access',
+          host: 'github.com',
+          token: 'hello'
+        }
+      ]
+    )
+
+    it('removes it from the metadata', () => {
+      expect(jobDetails['credentials-metadata']).toEqual([
+        {
+          type: 'git_source',
+          host: 'github.com'
+        }
+      ])
+    })
+  })
+
+  describe('when given a tenant-id and client-id in credentials', () => {
+    const jobDetails = {...mockJobDetails}
+
+    new Updater(
+      'MOCK_UPDATER_IMAGE_NAME',
+      'MOCK_PROXY_IMAGE_NAME',
+      mockApiClient,
+      jobDetails,
+      [
+        {
+          type: 'git_source',
+          host: 'github.com',
+          username: 'user',
+          password: 'pass'
+        },
+        {
+          type: 'npm_registry',
+          host: 'registry.npmjs.org',
+          'tenant-id': '12345678-1234-1234-1234-123456789012',
+          'client-id': '87654321-4321-4321-4321-210987654321'
+        }
+      ]
+    )
+
+    it('they are excluded from the credentials metadata', () => {
+      expect(jobDetails['credentials-metadata']).toEqual([
+        {
+          type: 'git_source',
+          host: 'github.com'
+        },
+        {
+          type: 'npm_registry',
+          host: 'registry.npmjs.org'
+        }
+      ])
+    })
+  })
+})

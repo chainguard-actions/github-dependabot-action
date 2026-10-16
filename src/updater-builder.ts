@@ -1,0 +1,107 @@
+import * as core from '@actions/core'
+import Docker, {Container} from 'dockerode'
+import {ContainerService} from './container-service'
+import {FileFetcherInput, FileUpdaterInput} from './config-types'
+import {JobParameters} from './inputs'
+import {Proxy} from './proxy'
+import {extractUpdaterSha} from './utils'
+
+const JOB_OUTPUT_FILENAME = 'output.json'
+const JOB_OUTPUT_PATH = '/home/dependabot/dependabot-updater/output'
+const JOB_INPUT_FILENAME = 'job.json'
+const JOB_INPUT_PATH = `/home/dependabot/dependabot-updater`
+const REPO_CONTENTS_PATH = '/home/dependabot/dependabot-updater/repo'
+const CA_CERT_INPUT_PATH = '/usr/local/share/ca-certificates'
+const CA_CERT_FILENAME = 'dbot-ca.crt'
+const UPDATER_MAX_MEMORY = 8 * 1024 * 1024 * 1024 // 8GB in bytes
+
+export class UpdaterBuilder {
+  constructor(
+    private readonly docker: Docker,
+    private readonly jobParams: JobParameters,
+    private readonly input: FileFetcherInput | FileUpdaterInput,
+    private readonly proxy: Proxy,
+
+    private readonly updaterImage: string
+  ) {}
+
+  async run(containerName: string): Promise<Container> {
+    const proxyUrl = await this.proxy.url()
+    const updaterSha = extractUpdaterSha(this.updaterImage)
+
+    const envVars = [
+      `GITHUB_ACTIONS=${process.env.GITHUB_ACTIONS}`,
+      `DEPENDABOT_JOB_ID=${this.jobParams.jobId}`,
+      `DEPENDABOT_JOB_TOKEN=`,
+      `DEPENDABOT_JOB_PATH=${JOB_INPUT_PATH}/${JOB_INPUT_FILENAME}`,
+      `DEPENDABOT_OPEN_TIMEOUT_IN_SECONDS=15`,
+      `DEPENDABOT_OUTPUT_PATH=${JOB_OUTPUT_PATH}/${JOB_OUTPUT_FILENAME}`,
+      `DEPENDABOT_REPO_CONTENTS_PATH=${REPO_CONTENTS_PATH}`,
+      `DEPENDABOT_API_URL=${this.jobParams.dependabotApiDockerUrl}`,
+      `SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt`,
+      `http_proxy=${proxyUrl}`,
+      `HTTP_PROXY=${proxyUrl}`,
+      `https_proxy=${proxyUrl}`,
+      `HTTPS_PROXY=${proxyUrl}`,
+      `UPDATER_ONE_CONTAINER=1`,
+      `ENABLE_CONNECTIVITY_CHECK=${
+        process.env.DEPENDABOT_ENABLE_CONNECTIVITY_CHECK || '1'
+      }`,
+      // Increase V8 heap size from the default ~2GB to 4GB.
+      // The container memory limit (UPDATER_MAX_MEMORY) is 8GB, but Node.js
+      // auto-scaling caps V8 heap at ~2GB for containers above 4GB.
+      // This is insufficient for large pnpm/npm monorepos (100+ workspace
+      // packages) where lockfile regeneration requires more heap.
+      // 4GB is half the container limit, leaving room for Ruby and other processes.
+      // See: https://github.com/dependabot/dependabot-core/issues/14596
+      `NODE_OPTIONS=--max-old-space-size=4096`
+    ]
+
+    // Add DEPENDABOT_UPDATER_SHA if we successfully extracted a SHA
+    if (updaterSha !== null) {
+      envVars.push(`DEPENDABOT_UPDATER_SHA=${updaterSha}`)
+    }
+
+    // Pass through OPENSSL_FORCE_FIPS_MODE from the host if set.
+    // The container does not have the OpenSSL FIPS provider installed, so OpenSSL fails while running update-ca-certificates on FIPS-enabled self-hosted runners.
+    // Setting OPENSSL_FORCE_FIPS_MODE=0 on the host works around this by explicitly preventing OpenSSL from using FIPS.
+    // We only propagate the env variable when it is explicitly set so as not to alter default behavior.
+    if (process.env.OPENSSL_FORCE_FIPS_MODE !== undefined) {
+      envVars.push(
+        `OPENSSL_FORCE_FIPS_MODE=${process.env.OPENSSL_FORCE_FIPS_MODE}`
+      )
+    }
+
+    const container = await this.docker.createContainer({
+      Image: this.updaterImage,
+      name: containerName,
+      AttachStdout: true,
+      AttachStderr: true,
+      User: 'dependabot',
+      Env: envVars,
+      Cmd: ['/bin/sh'],
+      Tty: true,
+      HostConfig: {
+        Memory: UPDATER_MAX_MEMORY,
+        NetworkMode: this.proxy.networkName
+      }
+    })
+
+    await ContainerService.storeCert(
+      CA_CERT_FILENAME,
+      CA_CERT_INPUT_PATH,
+      container,
+      this.proxy.cert
+    )
+
+    await ContainerService.storeInput(
+      JOB_INPUT_FILENAME,
+      JOB_INPUT_PATH,
+      container,
+      this.input
+    )
+
+    core.info(`Created container: ${container.id}`)
+    return container
+  }
+}
