@@ -1,0 +1,28 @@
+name: Test invalid GITHUB_REGISTRIES_PROXY - action handles gracefully
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # When GITHUB_REGISTRIES_PROXY is set to invalid base64/JSON,
+      # the action should handle it gracefully (log a warning, not crash).
+      # Since the actor check fires first (actor != dependabot[bot]),
+      # the action still exits cleanly with "nothing to do".
+      - id: action
+        uses: .
+        env:
+          GITHUB_REGISTRIES_PROXY: "not-valid-base64!!!"
+
+      - name: Assert action succeeded despite invalid GITHUB_REGISTRIES_PROXY
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          echo "outcome: $OUTCOME"
+          if [ "$OUTCOME" != "success" ]; then
+            echo "FAIL: expected action to succeed even with invalid GITHUB_REGISTRIES_PROXY, got '$OUTCOME'"
+            exit 1
+          fi
+          echo "PASS: action handled invalid GITHUB_REGISTRIES_PROXY gracefully"

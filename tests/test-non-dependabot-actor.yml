@@ -1,0 +1,27 @@
+name: Test non-dependabot actor - action warns and exits cleanly
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # When the actor is not 'dependabot[bot]', the action should:
+      # 1. Log a warning: "This workflow can only be triggered by Dependabot"
+      # 2. Return null (nothing to do)
+      # 3. Log: "finished: nothing to do"
+      # 4. Exit with success (no core.setFailed call)
+      - id: action
+        uses: .
+
+      - name: Assert action succeeded (no setFailed called)
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          echo "outcome: $OUTCOME"
+          if [ "$OUTCOME" != "success" ]; then
+            echo "FAIL: expected action to succeed when actor is not dependabot[bot], got '$OUTCOME'"
+            exit 1
+          fi
+          echo "PASS: action exited cleanly for non-dependabot actor"
